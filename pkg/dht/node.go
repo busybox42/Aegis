@@ -1,4 +1,3 @@
-// pkg/dht/node.go
 package dht
 
 import (
@@ -11,8 +10,6 @@ import (
 )
 
 const (
-    K = 20 // Size of k-buckets
-    ALPHA = 3 // Number of parallel lookups
     BUCKET_SIZE = 160 // Number of buckets (SHA-1 size in bits)
 )
 
@@ -25,16 +22,13 @@ func (b *Bucket) addNode(node *types.Node) error {
     b.mu.Lock()
     defer b.mu.Unlock()
 
-    // Check if node already exists
     for i, n := range b.nodes {
         if bytes.Equal(n.ID, node.ID) {
-            // Update existing node
             b.nodes[i] = node
             return nil
         }
     }
 
-    // Add new node if bucket isn't full
     if len(b.nodes) < K {
         b.nodes = append(b.nodes, node)
         return nil
@@ -97,14 +91,12 @@ func (rt *RoutingTable) RemoveNode(nodeID []byte) {
 }
 
 func (rt *RoutingTable) GetClosestNodes(target []byte, count int) []*types.Node {
-    // Get distance from target to our node ID
     targetInt := binary.BigEndian.Uint64(target[:8])
     distances := make(map[*types.Node]uint64)
     
     rt.mu.RLock()
     defer rt.mu.RUnlock()
 
-    // Calculate distances for all nodes
     for _, bucket := range rt.buckets {
         for _, node := range bucket.getNodes() {
             nodeInt := binary.BigEndian.Uint64(node.ID[:8])
@@ -113,7 +105,6 @@ func (rt *RoutingTable) GetClosestNodes(target []byte, count int) []*types.Node 
         }
     }
 
-    // Sort nodes by distance
     closest := make([]*types.Node, 0, count)
     for len(closest) < count && len(distances) > 0 {
         var minNode *types.Node
@@ -136,19 +127,16 @@ func (rt *RoutingTable) GetClosestNodes(target []byte, count int) []*types.Node 
 }
 
 func (rt *RoutingTable) getBucketIndex(nodeID []byte) int {
-    // XOR distance between our ID and node ID
     distance := xorDistance(rt.self.ID, nodeID)
     
-    // Find the index of the first set bit in the entire distance
     for i := 0; i < len(distance); i++ {
         if distance[i] == 0 {
             continue
         }
-        // Return bucket index based on the position of the first different bit
         return i*8 + bits.LeadingZeros8(distance[i]) % BUCKET_SIZE
     }
     
-    return BUCKET_SIZE - 1 // If IDs are identical (shouldn't happen)
+    return BUCKET_SIZE - 1
 }
 
 func xorDistance(a, b []byte) []byte {

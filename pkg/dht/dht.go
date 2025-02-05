@@ -1,103 +1,114 @@
-// pkg/dht/dht.go
 package dht
 
 import (
-    "context"
-    "errors"
-    "github.com/busybox42/Aegis/pkg/types"
-    "sync"
+        "context"
+        "errors"
+        "log"
+        "sync"
+        "time"
+        "fmt"
+
+        "github.com/busybox42/Aegis/pkg/types"
 )
 
-// NetworkFinder defines the interface for node lookup
+// Network-wide constants
+const (
+        ALPHA = 3  // Number of parallel lookups
+        K     = 20 // Maximum size of node lists
+)
+
 type NetworkFinder interface {
-    FindNode(ctx context.Context, target *types.Node, targetID []byte) ([]*types.Node, error)
+        FindNode(ctx context.Context, target *types.Node, targetID []byte) ([]*types.Node, error)
 }
 
 type DHT struct {
-    routingTable *RoutingTable
-    network      NetworkFinder
-    mu           sync.RWMutex
+        routingTable *RoutingTable
+        network      NetworkFinder
+        mu           sync.RWMutex
+        self         *types.Node
 }
 
-func NewDHT(self *types.Node, network NetworkFinder) *DHT {
-    return &DHT{
-        routingTable: NewRoutingTable(self),
-        network:      network,
-    }
+type Option func(*DHT)
+
+func NewDHT(self *types.Node, network NetworkFinder, opts ...Option) *DHT {
+        dht := &DHT{
+                routingTable: NewRoutingTable(self),
+                network:      network,
+                self:         self,
+        }
+
+        for _, opt := range opts {
+                opt(dht)
+        }
+
+        return dht
 }
 
 func (dht *DHT) Bootstrap(bootstrapNodes []*types.Node) error {
-    for _, node := range bootstrapNodes {
-        if err := dht.routingTable.AddNode(node); err != nil {
-            continue
+        log.Printf("Starting DHT bootstrap with %d nodes", len(bootstrapNodes))
+        
+        for _, node := range bootstrapNodes {
+                if err := dht.routingTable.AddNode(node); err != nil {
+                        log.Printf("Failed to add bootstrap node %v: %v", node.Address, err)
+                        continue
+                }
+                log.Printf("Added bootstrap node: %v", node.Address)
         }
-    }
 
-    // Perform node lookups for random targets to populate routing table
-    for i := 0; i < 3; i++ {
-        randomID := make([]byte, 20)
-        dht.FindNode(context.Background(), randomID)
-    }
+        log.Printf("Starting initial node discovery with own ID: %x", dht.self.PublicKey)
+        ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+        defer cancel()
 
-    return nil
+        nodes, err := dht.FindNode(ctx, dht.self.PublicKey)
+        if err != nil {
+                log.Printf("Initial node discovery failed: %v", err)
+        } else {
+                log.Printf("Found %d nodes during bootstrap", len(nodes))
+                for _, node := range nodes {
+                        if err := dht.routingTable.AddNode(node); err != nil {
+                                log.Printf("Failed to add discovered node: %v", err)
+                        }
+                }
+        }
+        
+        return nil
 }
 
 func (dht *DHT) FindNode(ctx context.Context, targetID []byte) ([]*types.Node, error) {
-    visited := make(map[string]bool)
-    results := make([]*types.Node, 0, K)
-
-    // Get initial closest nodes
     closest := dht.routingTable.GetClosestNodes(targetID, ALPHA)
     if len(closest) == 0 {
         return nil, errors.New("no nodes available")
     }
 
-    // Create channels for concurrent lookups
-    resultChan := make(chan []*types.Node, ALPHA)
-    doneChan := make(chan struct{})
-
-    // Start concurrent lookups
+    visited := make(map[string]bool)
+    results := make([]*types.Node, 0)
+    
     for _, node := range closest {
-        go func(n *types.Node) {
-            nodes, err := dht.network.FindNode(ctx, n, targetID)
-            if err != nil {
-                resultChan <- nil
-                return
-            }
-            resultChan <- nodes
-        }(node)
-    }
+        if ctx.Err() != nil {
+            break
+        }
 
-    // Collect results
-    go func() {
-        for {
-            select {
-            case nodes := <-resultChan:
-                if nodes == nil {
-                    continue
-                }
+        nodes, err := dht.network.FindNode(ctx, node, targetID)
+        if err != nil {
+            continue
+        }
 
-                for _, node := range nodes {
-                    nodeKey := string(node.ID)
-                    if !visited[nodeKey] {
-                        visited[nodeKey] = true
-                        results = append(results, node)
-                        dht.routingTable.AddNode(node)
-                    }
-                }
-
-                if len(results) >= K {
-                    close(doneChan)
-                    return
-                }
-
-            case <-ctx.Done():
-                close(doneChan)
-                return
+        for _, n := range nodes {
+            nodeKey := string(n.PublicKey)
+            if !visited[nodeKey] {
+                visited[nodeKey] = true
+                results = append(results, n)
+                dht.routingTable.AddNode(n)
             }
         }
-    }()
+    }
 
-    <-doneChan
-    return results, nil
+    if len(results) > 0 {
+        return results, nil
+    }
+    return nil, fmt.Errorf("node not found: %x", targetID)
+}
+
+func (dht *DHT) AddNode(node *types.Node) error {
+        return dht.routingTable.AddNode(node)
 }
