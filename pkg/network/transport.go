@@ -224,7 +224,7 @@ func (t *Transport) handleConnection(conn net.Conn) {
                 if err := handler(msg); err != nil {
                     log.Printf("Handler error: %v", err)
                 } else if msg.Type == protocol.TextMessage {
-                    log.Printf("Handled message from peer %x", msg.Sender[:8])
+                    //log.Printf("Handled message from peer %x", msg.Sender[:8])
                 }
             }
         }
@@ -377,4 +377,11 @@ func sendMessageToConn(conn net.Conn, msg *protocol.Message) error {
     }
 
     return nil
+}
+
+func (t *Transport) RangePeers(f func(publicKey []byte, peer *Peer) bool) {
+    t.peers.Range(func(key, value interface{}) bool {
+        peer := value.(*Peer)
+        return f(peer.PublicKey, peer)
+    })
 }

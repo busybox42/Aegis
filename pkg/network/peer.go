@@ -5,7 +5,6 @@ import (
    "encoding/binary"
    "fmt"
    "io"
-   "log"
    "net"
    "sync"
    "time"
@@ -138,8 +137,6 @@ func (p *Peer) SendMessage(msg *protocol.Message) error {
     if !p.connected || p.conn == nil {
         return fmt.Errorf("peer not connected")
     }
-
-    log.Printf("[DEBUG] Sending message type %v to peer %x", msg.Type, msg.Recipient)
     
     data, err := msg.Serialize()
     if err != nil {

@@ -97,8 +97,8 @@ func (cli *AegisCLI) initializeNetwork(port int) error {
     
     // Register peer discovery handler
     cli.transport.RegisterHandler(protocol.TextMessage, func(msg *protocol.Message) error {
-		log.Printf("[DEBUG] Received text message from %x", msg.Sender)
-		log.Printf("[DEBUG] Message content: %s", string(msg.Content))
+		log.Printf("[INFO] Received text message from %x", msg.Sender)
+		log.Printf("[INFO] Message content: %s", string(msg.Content))
 		return nil
 	})
 
