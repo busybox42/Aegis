@@ -21,17 +21,3 @@ type Message struct {
     Value     []byte
     Neighbors []*types.Node
 }
-
-type DHTProtocol interface {
-    // FindNode looks for nodes close to targetID
-    FindNode(targetID []byte) ([]*types.Node, error)
-    
-    // Store stores a value in the DHT
-    Store(key []byte, value []byte) error
-    
-    // FindValue retrieves a stored value
-    FindValue(key []byte) ([]byte, error)
-    
-    // Ping checks if a node is alive
-    Ping(node *types.Node) error
-}

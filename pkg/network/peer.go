@@ -169,25 +169,3 @@ func (t *Transport) handleMessage(msg *protocol.Message) error {
     }
     return nil
 }
-
-func (p *Peer) WaitForConnection(timeout time.Duration) bool {
-   deadline := time.Now().Add(timeout)
-   for time.Now().Before(deadline) {
-       if p.IsConnected() {
-           return true
-       }
-       time.Sleep(100 * time.Millisecond)
-   }
-   return false
-}
-
-func (p *Peer) ensureConnected() error {
-    p.mu.RLock()
-    if p.connected && p.conn != nil {
-        p.mu.RUnlock()
-        return nil
-    }
-    p.mu.RUnlock()
-    
-    return p.Connect()
-}

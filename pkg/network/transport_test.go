@@ -263,16 +263,3 @@ func checkFullMesh(nodes ...*Transport) bool {
     }
     return true
 }
-
-func dumpPeerStates(nodes ...*Transport) {
-    log.Printf("[DEBUG] === Peer States ===")
-    for i, node := range nodes {
-        log.Printf("[DEBUG] Node %d peers:", i+1)
-        node.peers.Range(func(key, value interface{}) bool {
-            peer := value.(*Peer)
-            log.Printf("[DEBUG] - Peer %x: connected=%v, addr=%v", 
-                peer.PublicKey, peer.IsConnected(), peer.Address)
-            return true
-        })
-    }
-}
