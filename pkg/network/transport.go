@@ -9,7 +9,6 @@ import (
     "log"
     "net"
     "sync"
-    "sync/atomic"
     "time"
 
     "github.com/busybox42/Aegis/pkg/dht"
@@ -22,10 +21,11 @@ type Transport struct {
     listener        net.Listener
     dht             *dht.DHT
     peers           sync.Map
+    peerConnections sync.Map
     handlers        sync.Map
     ctx             context.Context
     cancel          context.CancelFunc
-    connectionCount int32
+    mu             sync.RWMutex
 }
 
 func NewTransport(cfg *Config) *Transport {
@@ -43,102 +43,21 @@ func (t *Transport) Start() error {
         return fmt.Errorf("failed to start listener: %w", err)
     }
     t.listener = listener
-    log.Printf("[DEBUG] Listener started on %v", listener.Addr())
 
     localNode := types.NewNode(t.config.PublicKey, t.listener.Addr().(*net.TCPAddr))
     t.dht = dht.NewDHT(localNode, t)
-    log.Printf("[DEBUG] DHT initialized with local node %x", t.config.PublicKey)
 
     go t.acceptLoop()
-    go t.startPeerRefresh()
 
+    // Initialize bootstrap connections after a short delay
     if len(t.config.Bootstrap) > 0 {
-        go t.bootstrapNetwork()
+        go func() {
+            time.Sleep(100 * time.Millisecond) // Allow listener to start
+            t.bootstrapNetwork()
+        }()
     }
 
     return nil
-}
-
-func (t *Transport) bootstrapNetwork() {
-    for _, addr := range t.config.Bootstrap {
-        log.Printf("[DEBUG] Attempting to bootstrap with node at %v", addr)
-        peer := NewPeer(nil, addr)
-        
-        if err := peer.Connect(); err != nil {
-            log.Printf("[WARN] Bootstrap connection failed: %v", err)
-            continue
-        }
-
-        // Send discovery message
-        discoveryMsg := protocol.NewMessage(protocol.PeerDiscovery, t.config.PublicKey, nil, nil)
-        discoveryMsg.Sign(t.config.PrivateKey)
-
-        // Set message handler before sending discovery
-        peer.SetMessageHandler(func(m *protocol.Message) error {
-            if m.Type == protocol.PeerDiscovery {
-                peer.PublicKey = m.Sender
-                t.peers.Store(string(m.Sender), peer)
-                log.Printf("[DEBUG] Stored peer with key %x", m.Sender)
-            }
-            if handler, ok := t.getHandler(m.Type); ok {
-                return handler(m)
-            }
-            return nil
-        })
-
-        if err := peer.SendMessage(discoveryMsg); err != nil {
-            log.Printf("[ERROR] Failed to send discovery: %v", err)
-            peer.Disconnect()
-            continue
-        }
-    }
-}
-
-// Add this helper function
-func sendMessageToConn(conn net.Conn, msg *protocol.Message) error {
-    data, err := msg.Serialize()
-    if err != nil {
-        return fmt.Errorf("serialization error: %w", err)
-    }
-
-    if err := binary.Write(conn, binary.BigEndian, uint32(len(data))); err != nil {
-        return fmt.Errorf("failed to write message length: %w", err)
-    }
-
-    if _, err := conn.Write(data); err != nil {
-        return fmt.Errorf("failed to write message: %w", err)
-    }
-
-    return nil
-}
-
-func (t *Transport) startPeerRefresh() {
-    ticker := time.NewTicker(5 * time.Minute)
-    defer ticker.Stop()
-
-    for {
-        select {
-        case <-ticker.C:
-            t.refreshPeers()
-        case <-t.ctx.Done():
-            return
-        }
-    }
-}
-
-func (t *Transport) refreshPeers() {
-    var staleNodes []*types.Node
-    t.peers.Range(func(key, value interface{}) bool {
-        peer := value.(*Peer)
-        if time.Since(peer.lastActive) > 15*time.Minute {
-            staleNodes = append(staleNodes, types.NewNode(peer.PublicKey, peer.Address))
-        }
-        return true
-    })
-
-    for _, node := range staleNodes {
-        t.dht.FindNode(context.Background(), node.PublicKey)
-    }
 }
 
 func (t *Transport) Stop() error {
@@ -156,66 +75,46 @@ func (t *Transport) Stop() error {
     return nil
 }
 
-func (t *Transport) acceptLoop() {
-    connID := atomic.AddInt32(&t.connectionCount, 1)
-    log.Printf("[%d] Starting accept loop", connID)
-
-    for {
-        select {
-        case <-t.ctx.Done():
-            log.Printf("[%d] Accept loop terminated", connID)
-            return
-        default:
-            conn, err := t.listener.Accept()
-            if err != nil {
-                if t.ctx.Err() != nil {
-                    return
-                }
-                log.Printf("[%d] Accept error: %v", connID, err)
-                continue
-            }
-            log.Printf("[%d] Accepted new connection from %v", connID, conn.RemoteAddr())
-            go t.handleConnection(conn)
-        }
+func (t *Transport) SendMessage(ctx context.Context, msg *protocol.Message) error {
+    if !msg.Verify() {
+        return fmt.Errorf("invalid message signature")
     }
-}
 
-func (t *Transport) handlePeerDiscovery(conn net.Conn, msg *protocol.Message) error {
-    addr := conn.RemoteAddr().(*net.TCPAddr)
-    
-    // Create or update peer with full information
-    peer := NewPeer(msg.Sender, addr)
-    peer.conn = conn
-    peer.connected = true
-
-    // Store peer with complete information
-    t.peers.Store(string(msg.Sender), peer)
-    log.Printf("[DEBUG] Stored peer discovery from %x", msg.Sender)
-
-    // Send response with local node information
-    resp := protocol.NewMessage(
-        protocol.PeerDiscovery, 
-        t.config.PublicKey,  // Sender is local node 
-        msg.Sender,          // Recipient is the original sender
-        []byte(t.listener.Addr().String()), // Additional node info
-    )
-    resp.Sign(t.config.PrivateKey)
-
-    // Set up message handler
-    peer.SetMessageHandler(func(m *protocol.Message) error {
-        if handler, ok := t.getHandler(m.Type); ok {
-            return handler(m)
+    var targetPeer *Peer
+    t.peers.Range(func(key, value interface{}) bool {
+        peer := value.(*Peer)
+        if bytes.Equal(peer.PublicKey, msg.Recipient) {
+            targetPeer = peer
+            return false
         }
-        return nil
+        return true
     })
 
-    // Send response and start connection handling
-    if err := peer.SendMessage(resp); err != nil {
-        log.Printf("[ERROR] Failed to send discovery response: %v", err)
+    if targetPeer == nil {
+        return fmt.Errorf("peer not found: %x", msg.Recipient)
     }
-    go peer.handleConnection(conn)
 
-    return nil
+    if !targetPeer.IsConnected() {
+        if err := targetPeer.Connect(); err != nil {
+            return fmt.Errorf("connection failed: %w", err)
+        }
+    }
+
+    if msg.Type == protocol.TextMessage {
+        log.Printf("Sending message to peer %x", targetPeer.PublicKey[:8])
+    }
+
+    sendCh := make(chan error, 1)
+    go func() {
+        sendCh <- targetPeer.SendMessage(msg)
+    }()
+
+    select {
+    case err := <-sendCh:
+        return err
+    case <-ctx.Done():
+        return ctx.Err()
+    }
 }
 
 func (t *Transport) RegisterHandler(msgType protocol.MessageType, handler MessageHandlerFunc) {
@@ -223,45 +122,7 @@ func (t *Transport) RegisterHandler(msgType protocol.MessageType, handler Messag
     log.Printf("Registered handler for message type %v", msgType)
 }
 
-func (t *Transport) getHandler(msgType protocol.MessageType) (MessageHandlerFunc, bool) {
-    handler, ok := t.handlers.Load(msgType)
-    if !ok {
-        return nil, false
-    }
-    return handler.(MessageHandlerFunc), true
-}
-
-func (t *Transport) SendMessage(ctx context.Context, msg *protocol.Message) error {
-    log.Printf("[DEBUG] Attempting to send message to %x", msg.Recipient)
-    
-    peerI, ok := t.peers.Load(string(msg.Recipient))
-    if !ok || peerI == nil {
-        // Log all known peers for debugging
-        log.Printf("[DEBUG] Peer not found. Known peers:")
-        t.peers.Range(func(key, value interface{}) bool {
-            peer := value.(*Peer)
-            log.Printf("[DEBUG]  - %x @ %v", peer.PublicKey, peer.Address)
-            return true
-        })
-        return fmt.Errorf("peer not found: %x", msg.Recipient)
-    }
-    
-    peer := peerI.(*Peer)
-    log.Printf("[DEBUG] Found peer: %x @ %v", peer.PublicKey, peer.Address)
-
-    if !peer.IsConnected() {
-        log.Printf("[DEBUG] Peer not connected, attempting to connect")
-        if err := peer.Connect(); err != nil {
-            log.Printf("[ERROR] Failed to connect to peer: %v", err)
-            return fmt.Errorf("failed to connect: %w", err)
-        }
-    }
-
-    return peer.SendMessage(msg)
-}
-
 func (t *Transport) FindNode(ctx context.Context, node *types.Node, targetID []byte) ([]*types.Node, error) {
-    // Local peer check remains the same
     var localNodes []*types.Node
     t.peers.Range(func(key, value interface{}) bool {
         peer := value.(*Peer)
@@ -275,7 +136,6 @@ func (t *Transport) FindNode(ctx context.Context, node *types.Node, targetID []b
         return localNodes, nil
     }
 
-    // Try bootstrap node at 8080 explicitly
     bootstrapAddr := &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 8080}
     peer := NewPeer(nil, bootstrapAddr)
     
@@ -283,7 +143,6 @@ func (t *Transport) FindNode(ctx context.Context, node *types.Node, targetID []b
         return nil, fmt.Errorf("bootstrap connection failed: %v", err)
     }
 
-    // Send discovery message to bootstrap node
     msg := protocol.NewMessage(protocol.PeerDiscovery, t.config.PublicKey, targetID, nil)
     msg.Sign(t.config.PrivateKey)
 
@@ -292,7 +151,6 @@ func (t *Transport) FindNode(ctx context.Context, node *types.Node, targetID []b
         return nil, fmt.Errorf("failed to send discovery to bootstrap: %v", err)
     }
 
-    // Wait and collect peers
     time.Sleep(1 * time.Second)
     
     var discoveredNodes []*types.Node
@@ -311,43 +169,212 @@ func (t *Transport) FindNode(ctx context.Context, node *types.Node, targetID []b
     return nil, fmt.Errorf("no nodes found for target %x", targetID)
 }
 
+func (t *Transport) acceptLoop() {
+    for {
+        select {
+        case <-t.ctx.Done():
+            return
+        default:
+            conn, err := t.listener.Accept()
+            if err != nil {
+                if t.ctx.Err() != nil {
+                    return
+                }
+                continue
+            }
+            go t.handleConnection(conn)
+        }
+    }
+}
+
 func (t *Transport) handleConnection(conn net.Conn) {
-    connID := atomic.AddInt32(&t.connectionCount, 1)
-    log.Printf("[%d] Handling new connection from %v", connID, conn.RemoteAddr())
+    defer conn.Close()
 
-    var msgLen uint32
-    if err := binary.Read(conn, binary.BigEndian, &msgLen); err != nil {
-        log.Printf("[%d] Error reading message length: %v", connID, err)
-        return
+    for {
+        conn.SetReadDeadline(time.Now().Add(readTimeout))
+        
+        var msgLen uint32
+        if err := binary.Read(conn, binary.BigEndian, &msgLen); err != nil {
+            return
+        }
+
+        if msgLen > maxMsgSize {
+            return
+        }
+
+        msgData := make([]byte, msgLen)
+        if _, err := io.ReadFull(conn, msgData); err != nil {
+            return
+        }
+
+        conn.SetReadDeadline(time.Time{})
+
+        msg, err := protocol.DeserializeMessage(msgData)
+        if err != nil {
+            continue
+        }
+
+        switch msg.Type {
+        case protocol.PeerDiscovery:
+            if err := t.handlePeerDiscovery(conn, msg); err != nil {
+                log.Printf("Peer discovery error: %v", err)
+            }
+        default:
+            if handler, ok := t.getHandler(msg.Type); ok {
+                if err := handler(msg); err != nil {
+                    log.Printf("Handler error: %v", err)
+                } else if msg.Type == protocol.TextMessage {
+                    log.Printf("Handled message from peer %x", msg.Sender[:8])
+                }
+            }
+        }
     }
+}
 
-    msgData := make([]byte, msgLen)
-    if _, err := io.ReadFull(conn, msgData); err != nil {
-        log.Printf("[%d] Error reading message data: %v", connID, err)
-        return
+func (t *Transport) getHandler(msgType protocol.MessageType) (MessageHandlerFunc, bool) {
+    if handler, ok := t.handlers.Load(msgType); ok {
+        return handler.(MessageHandlerFunc), true
     }
+    return nil, false
+}
 
-    msg, err := protocol.DeserializeMessage(msgData)
-    if err != nil {
-        log.Printf("[%d] Error deserializing message: %v", connID, err)
-        return
-    }
-
+func (t *Transport) handlePeerDiscovery(conn net.Conn, msg *protocol.Message) error {
     if !msg.Verify() {
-        log.Printf("[%d] Message verification failed", connID)
-        return
+        return fmt.Errorf("invalid message signature")
     }
 
-    if msg.Type == protocol.PeerDiscovery {
-        if err := t.handlePeerDiscovery(conn, msg); err != nil {
-            log.Printf("[%d] Error handling discovery: %v", connID, err)
+    t.mu.Lock()
+    remoteAddr := conn.RemoteAddr().(*net.TCPAddr)
+    peerAddr := &net.TCPAddr{
+        IP:   remoteAddr.IP,
+        Port: msg.ListeningPort,
+    }
+    
+    senderPeer := NewPeer(msg.Sender, peerAddr)
+    t.mu.Unlock()
+
+    t.storePeer(senderPeer)
+
+    for _, peerInfo := range msg.PeerList {
+        if bytes.Equal(peerInfo.PublicKey, t.config.PublicKey) {
+            continue
         }
-        return
+        
+        addr, err := net.ResolveTCPAddr("tcp", peerInfo.Address)
+        if err != nil {
+            continue
+        }
+        
+        newPeer := NewPeer(peerInfo.PublicKey, addr)
+        t.storePeer(newPeer)
     }
 
-    if handler, ok := t.getHandler(msg.Type); ok {
-        if err := handler(msg); err != nil {
-            log.Printf("[%d] Handler error for message type %v: %v", connID, msg.Type, err)
+    t.mu.Lock()
+    response := protocol.NewMessage(protocol.PeerDiscovery, t.config.PublicKey, msg.Sender, nil)
+    response.ListeningPort = t.config.Port
+    response.PeerList = t.getKnownPeersLocked(msg.Sender)
+    t.mu.Unlock()
+    
+    response.Sign(t.config.PrivateKey)
+    return sendMessageToConn(conn, response)
+}
+
+func (t *Transport) bootstrapNetwork() {
+    for _, addr := range t.config.Bootstrap {
+        discoveryMsg := protocol.NewMessage(protocol.PeerDiscovery, t.config.PublicKey, nil, nil)
+        discoveryMsg.ListeningPort = t.config.Port
+        discoveryMsg.Sign(t.config.PrivateKey)
+ 
+        peer := NewPeer(nil, addr)
+        if err := peer.Connect(); err != nil {
+            continue
         }
+ 
+        t.storePeer(peer)
+        peer.SendMessage(discoveryMsg)
     }
+}
+
+func (t *Transport) storePeer(peer *Peer) {
+    if peer.PublicKey == nil || bytes.Equal(peer.PublicKey, t.config.PublicKey) {
+        return
+    }
+    
+    key := fmt.Sprintf("%x", peer.PublicKey)
+    
+    t.mu.Lock()
+    defer t.mu.Unlock()  // Ensure mutex is unlocked when we're done
+    
+    if existing, loaded := t.peers.LoadOrStore(key, peer); loaded {
+        existingPeer := existing.(*Peer)
+        if peer.Address != nil {
+            existingPeer.Address = peer.Address
+        }
+    } else {
+        // Create a new goroutine with copied data to avoid race conditions
+        peerCopy := *peer // Make a copy of the peer
+        go func() {
+            if err := peer.Connect(); err == nil {
+                t.mu.Lock()
+                msg := protocol.NewMessage(protocol.PeerDiscovery, t.config.PublicKey, peerCopy.PublicKey, nil)
+                msg.ListeningPort = t.config.Port
+                peerList := t.getKnownPeersLocked(peerCopy.PublicKey) // Use locked version
+                t.mu.Unlock()
+                
+                msg.PeerList = peerList
+                if err := msg.Sign(t.config.PrivateKey); err == nil {
+                    peer.SendMessage(msg)
+                }
+            }
+        }()
+    }
+}
+
+// getKnownPeersLocked assumes the mutex is already held
+func (t *Transport) getKnownPeersLocked(excludeKey []byte) []protocol.PeerInfo {
+    var peers []protocol.PeerInfo
+    seen := make(map[string]bool)
+
+    t.peers.Range(func(_, value interface{}) bool {
+        peer := value.(*Peer)
+        if peer.PublicKey == nil || bytes.Equal(peer.PublicKey, excludeKey) || 
+           bytes.Equal(peer.PublicKey, t.config.PublicKey) {
+            return true
+        }
+
+        peerKey := fmt.Sprintf("%x", peer.PublicKey)
+        if !seen[peerKey] {
+            peers = append(peers, protocol.PeerInfo{
+                PublicKey: peer.PublicKey,
+                Address:   peer.Address.String(),
+            })
+            seen[peerKey] = true
+        }
+        return true
+    })
+    return peers
+}
+
+// getKnownPeers acquires the mutex before getting peers
+func (t *Transport) getKnownPeers(excludeKey []byte) []protocol.PeerInfo {
+    t.mu.Lock()
+    defer t.mu.Unlock()
+    return t.getKnownPeersLocked(excludeKey)
+}
+
+func sendMessageToConn(conn net.Conn, msg *protocol.Message) error {
+    data, err := msg.Serialize()
+    if err != nil {
+        return fmt.Errorf("serialization error: %w", err)
+    }
+
+    if err := binary.Write(conn, binary.BigEndian, uint32(len(data))); err != nil {
+        return fmt.Errorf("failed to write message length: %w", err)
+    }
+
+    if _, err := conn.Write(data); err != nil {
+        return fmt.Errorf("failed to write message: %w", err)
+    }
+
+    return nil
 }
