@@ -114,11 +114,13 @@ func (cli *AegisCLI) initializeNetwork(port int, bootstrapPort int) error {
 
 	// Register message handler
 	cli.transport.RegisterHandler(protocol.TextMessage, func(msg *protocol.Message) error {
+		timestamp := time.Now().Format("2006-01-02 15:04:05")
+		
 		// Clear the current line
 		fmt.Print("\r")
 		
-		// Print the message
-		fmt.Printf("\nReceived message from %x: %s\n", msg.Sender[:8], string(msg.Content))
+		// Print the message with timestamp
+		fmt.Printf("\n[%s] Received message from %x: %s\n", timestamp, msg.Sender[:8], string(msg.Content))
 		
 		// Reprint the prompt
 		fmt.Print("aegis> ")
@@ -132,7 +134,7 @@ func (cli *AegisCLI) initializeNetwork(port int, bootstrapPort int) error {
 			Status:    "received",
 		})
 		return nil
-	})
+	})	
 
 	cli.dht = dht.NewDHT(cli.localNode, cli.transport)
 
@@ -382,23 +384,20 @@ func main() {
 	cli := newAegisCLI()
 
 	// Command-line flags
-	isServer := flag.Bool("server", false, "Run as a server node")
-	port := flag.Int("port", 0, "Port to listen on (default: 8080 for server, random for client)")
+	port := flag.Int("port", 0, "Port to listen on (random high port if not specified)")
+	bootstrapIP := flag.String("bootstrap-ip", "127.0.0.1", "Bootstrap node IP address")
+	bootstrapPort := flag.Int("bootstrap-port", 8080, "Bootstrap node port")
 	flag.Parse()
 
 	// Determine port
 	if *port == 0 {
-		if *isServer {
-			*port = 8080 // Default server port
-		} else {
-			// Get random available port
-			listener, err := net.Listen("tcp", "127.0.0.1:0")
-			if err != nil {
-				log.Fatalf("Failed to find available port: %v", err)
-			}
-			*port = listener.Addr().(*net.TCPAddr).Port
-			listener.Close()
+		// Get random available port
+		listener, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			log.Fatalf("Failed to find available port: %v", err)
 		}
+		*port = listener.Addr().(*net.TCPAddr).Port
+		listener.Close()
 	}
 
 	// Initialize keys with port
@@ -406,14 +405,8 @@ func main() {
 		log.Fatalf("Failed to initialize keys: %v", err)
 	}
 
-	// Configure bootstrap - servers bootstrap to themselves, clients to default server
-	bootstrapPort := 8080
-	if *isServer {
-		bootstrapPort = *port
-	}
-
-	log.Printf("Starting Aegis node on port %d (server: %v)", *port, *isServer)
-	if err := cli.startInteractiveCLI(*port, bootstrapPort, *isServer); err != nil {
+	log.Printf("Starting Aegis client on port %d, bootstrapping to %s:%d", *port, *bootstrapIP, *bootstrapPort)
+	if err := cli.startInteractiveCLI(*port, *bootstrapPort, false); err != nil {
 		log.Fatalf("CLI error: %v", err)
 	}
 }

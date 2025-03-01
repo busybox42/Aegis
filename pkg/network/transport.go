@@ -101,7 +101,8 @@ func (t *Transport) SendMessage(ctx context.Context, msg *protocol.Message) erro
     }
 
     if msg.Type == protocol.TextMessage {
-        log.Printf("Sending message to peer %x", targetPeer.PublicKey[:8])
+        timestamp := time.Now().Format("2006-01-02 15:04:05")
+        fmt.Printf("[%s] Sending message to %x\n", timestamp, targetPeer.PublicKey[:8])
     }
 
     sendCh := make(chan error, 1)
