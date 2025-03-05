@@ -11,8 +11,9 @@ import (
 // TestNewAegisServer ensures that the AegisServer initializes properly.
 func TestNewAegisServer(t *testing.T) {
 	port := 8081 // Use a non-standard port to avoid conflicts
+	useTor := false // Disable Tor for tests to avoid dependencies
 
-	server, err := newAegisServer(port)
+	server, err := newAegisServer(port, useTor)
 	if err != nil {
 		t.Fatalf("Failed to initialize Aegis server: %v", err)
 	}
@@ -78,7 +79,9 @@ func TestInitializeKeys(t *testing.T) {
 // TestInitializeNetwork ensures that the network initializes properly.
 func TestInitializeNetwork(t *testing.T) {
 	port := 8083
-	server := &AegisServer{}
+	server := &AegisServer{
+		useTor: false, // Disable Tor for tests
+	}
 
 	// Generate dummy keys for testing
 	pub, priv, err := ed25519.GenerateKey(nil)
@@ -113,4 +116,38 @@ func TestInitializeNetwork(t *testing.T) {
 	if server.dht == nil {
 		t.Fatal("DHT is nil after network initialization")
 	}
+}
+
+// TestTorNetwork tests the Tor integration (optional, skipped by default)
+func TestTorNetwork(t *testing.T) {
+    if testing.Short() {
+        t.Skip("Skipping Tor test in short mode")
+    }
+
+    port := 8084
+    server := &AegisServer{
+        useTor: true,
+    }
+
+    // Generate dummy keys for testing
+    pub, priv, err := ed25519.GenerateKey(nil)
+    if err != nil {
+        t.Fatalf("Failed to generate test keys: %v", err)
+    }
+    server.publicKey = pub
+    server.privateKey = priv
+
+    err = server.initializeNetwork(port)
+    if err != nil {
+        t.Skipf("Skipping test: Tor not available - %v", err)
+    }
+    
+    // Add this defer statement to properly clean up Tor
+    defer server.Stop()
+
+    if server.onionAddress == "" {
+        t.Error("Expected onion address, got empty string")
+    } else {
+        t.Logf("Onion address: %s", server.onionAddress)
+    }
 }

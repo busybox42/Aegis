@@ -20,20 +20,22 @@ const (
 )
 
 type PeerInfo struct {
-    PublicKey ed25519.PublicKey
-    Address   string
+    PublicKey    ed25519.PublicKey
+    Address      string
+    OnionAddress string // Add this field for .onion addresses
 }
 
 type Message struct {
-    ID        []byte            
-    Type      MessageType       
-    Sender    ed25519.PublicKey 
-    Recipient ed25519.PublicKey 
-    Content   []byte            
-    PeerList  []PeerInfo       
-    Timestamp time.Time         
-    Signature []byte
-    ListeningPort int             
+    ID           []byte            
+    Type         MessageType       
+    Sender       ed25519.PublicKey 
+    Recipient    ed25519.PublicKey 
+    Content      []byte            
+    PeerList     []PeerInfo       
+    Timestamp    time.Time         
+    Signature    []byte
+    ListeningPort int
+    OnionAddress string // Add this field for the sender's .onion address
 }
 
 func NewMessage(msgType MessageType, sender, recipient ed25519.PublicKey, content []byte) *Message {
@@ -88,9 +90,13 @@ func (m *Message) createDigest() []byte {
     buf.Write(m.Content)
     binary.Write(buf, binary.BigEndian, uint16(m.ListeningPort))
     
+    // Add onion address to digest
+    onionBytes := []byte(m.OnionAddress)
+    binary.Write(buf, binary.BigEndian, uint16(len(onionBytes)))
+    buf.Write(onionBytes)
+    
     return buf.Bytes()
 }
-
 
 func (m *Message) Serialize() ([]byte, error) {
     buf := new(bytes.Buffer)
@@ -132,6 +138,13 @@ func (m *Message) Serialize() ([]byte, error) {
             return nil, fmt.Errorf("failed to write address length: %w", err)
         }
         buf.Write(addrBytes)
+        
+        // Write onion address
+        onionBytes := []byte(peer.OnionAddress)
+        if err := binary.Write(buf, binary.BigEndian, uint16(len(onionBytes))); err != nil {
+            return nil, fmt.Errorf("failed to write onion address length: %w", err)
+        }
+        buf.Write(onionBytes)
     }
  
     if err := binary.Write(buf, binary.BigEndian, m.Timestamp.Unix()); err != nil {
@@ -142,6 +155,13 @@ func (m *Message) Serialize() ([]byte, error) {
     if err := binary.Write(buf, binary.BigEndian, uint16(m.ListeningPort)); err != nil {
         return nil, fmt.Errorf("failed to write listening port: %w", err)
     }
+    
+    // Write OnionAddress
+    onionBytes := []byte(m.OnionAddress)
+    if err := binary.Write(buf, binary.BigEndian, uint16(len(onionBytes))); err != nil {
+        return nil, fmt.Errorf("failed to write onion address length: %w", err)
+    }
+    buf.Write(onionBytes)
  
     if m.Signature != nil && len(m.Signature) > 0 {
         buf.Write(m.Signature)
@@ -206,10 +226,26 @@ func (m *Message) Serialize() ([]byte, error) {
         if _, err := io.ReadFull(buf, addrBytes); err != nil {
             return nil, fmt.Errorf("failed to read address: %w", err)
         }
+        
+        // Read onion address
+        var onionLen uint16
+        if err := binary.Read(buf, binary.BigEndian, &onionLen); err != nil {
+            return nil, fmt.Errorf("failed to read onion address length: %w", err)
+        }
+        
+        var onionAddr string
+        if onionLen > 0 {
+            onionBytes := make([]byte, onionLen)
+            if _, err := io.ReadFull(buf, onionBytes); err != nil {
+                return nil, fmt.Errorf("failed to read onion address: %w", err)
+            }
+            onionAddr = string(onionBytes)
+        }
  
         msg.PeerList = append(msg.PeerList, PeerInfo{
-            PublicKey: pubKey,
-            Address:   string(addrBytes),
+            PublicKey:    pubKey,
+            Address:      string(addrBytes),
+            OnionAddress: onionAddr,
         })
     }
  
@@ -225,6 +261,20 @@ func (m *Message) Serialize() ([]byte, error) {
         return nil, fmt.Errorf("failed to read listening port: %w", err)
     }
     msg.ListeningPort = int(port)
+    
+    // Read OnionAddress
+    var onionLen uint16
+    if err := binary.Read(buf, binary.BigEndian, &onionLen); err != nil {
+        return nil, fmt.Errorf("failed to read onion address length: %w", err)
+    }
+    
+    if onionLen > 0 {
+        onionBytes := make([]byte, onionLen)
+        if _, err := io.ReadFull(buf, onionBytes); err != nil {
+            return nil, fmt.Errorf("failed to read onion address: %w", err)
+        }
+        msg.OnionAddress = string(onionBytes)
+    }
  
     if buf.Len() == ed25519.SignatureSize {
         msg.Signature = make([]byte, ed25519.SignatureSize)

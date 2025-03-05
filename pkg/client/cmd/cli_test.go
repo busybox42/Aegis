@@ -3,10 +3,12 @@ package main
 import (
 	"crypto/ed25519"
 	"encoding/hex"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
+	"net"
 )
 
 // TestNewAegisCLI ensures that a new AegisCLI instance is properly initialized.
@@ -24,18 +26,23 @@ func TestNewAegisCLI(t *testing.T) {
 
 // TestInitializeKeys ensures key generation and loading work as expected.
 func TestInitializeKeys(t *testing.T) {
-	port := 9090
+	// Get a random available port for testing
+	port, err := getAvailablePort()
+	if err != nil {
+		t.Fatalf("Failed to get available port: %v", err)
+	}
+
 	cli := newAegisCLI()
 
 	keyDir := filepath.Join(os.Getenv("HOME"), ".aegis")
-	pubKeyPath := filepath.Join(keyDir, "public_9090.key")
-	privKeyPath := filepath.Join(keyDir, "private_9090.key")
+	pubKeyPath := filepath.Join(keyDir, fmt.Sprintf("public_%d.key", port))
+	privKeyPath := filepath.Join(keyDir, fmt.Sprintf("private_%d.key", port))
 
 	// Ensure cleanup before test
 	os.Remove(pubKeyPath)
 	os.Remove(privKeyPath)
 
-	err := cli.initializeKeys(port)
+	err = cli.initializeKeys(port)
 	if err != nil {
 		t.Fatalf("Failed to initialize keys: %v", err)
 	}
@@ -56,6 +63,16 @@ func TestInitializeKeys(t *testing.T) {
 	// Cleanup
 	os.Remove(pubKeyPath)
 	os.Remove(privKeyPath)
+}
+
+// Helper function to get an available port
+func getAvailablePort() (int, error) {
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return 0, err
+	}
+	defer l.Close()
+	return l.Addr().(*net.TCPAddr).Port, nil
 }
 
 // TestAddToHistory ensures that messages are correctly added to the history.
@@ -88,6 +105,9 @@ func TestAddToHistory(t *testing.T) {
 // TestSendMessage ensures that sending a message records it in history.
 func TestSendMessage(t *testing.T) {
 	cli := newAegisCLI()
+	
+	// Disable Tor for tests
+	cli.useTor = false
 
 	// Generate test keys
 	pub, priv, err := ed25519.GenerateKey(nil)
@@ -97,11 +117,23 @@ func TestSendMessage(t *testing.T) {
 	cli.publicKey = pub
 	cli.privateKey = priv
 
+	// Get random available ports for testing
+	clientPort, err := getAvailablePort()
+	if err != nil {
+		t.Fatalf("Failed to get available client port: %v", err)
+	}
+	
+	bootstrapPort, err := getAvailablePort()
+	if err != nil {
+		t.Fatalf("Failed to get available bootstrap port: %v", err)
+	}
+
 	// Initialize network 
-	err = cli.initializeNetwork(9092, 8080)
+	err = cli.initializeNetwork(clientPort, bootstrapPort)
 	if err != nil {
 		t.Fatalf("Failed to initialize network: %v", err)
 	}
+	defer cli.transport.Stop()
 
 	// Simulate a recipient key
 	recipient := make([]byte, 32)
@@ -127,4 +159,3 @@ func TestSendMessage(t *testing.T) {
 		t.Errorf("Expected message content 'Test message', got %s", lastRecord.Content)
 	}
 }
-

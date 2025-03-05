@@ -15,8 +15,10 @@ type MessageRouter interface {
 }
 
 type Config struct {
-	Port       int
-	PrivateKey ed25519.PrivateKey
-	PublicKey  ed25519.PublicKey
-	Bootstrap  []*net.TCPAddr
+	Port        int
+	PrivateKey  ed25519.PrivateKey
+	PublicKey   ed25519.PublicKey
+	Bootstrap   []*net.TCPAddr
+	BootstrapOnion string
+	UseTor      bool              
 }
