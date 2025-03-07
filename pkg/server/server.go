@@ -3,17 +3,18 @@ package main
 import (
 	"flag"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
-	"net"
 
 	"crypto/ed25519"
 
-	"github.com/sirupsen/logrus"
 	"github.com/busybox42/Aegis/internal/store"
 	"github.com/busybox42/Aegis/pkg/dht"
 	"github.com/busybox42/Aegis/pkg/network"
+	"github.com/busybox42/Aegis/pkg/tor"
 	"github.com/busybox42/Aegis/pkg/types"
+	"github.com/sirupsen/logrus"
 )
 
 var log = logrus.New()
@@ -33,17 +34,26 @@ type AegisServer struct {
 	localNode  *types.Node
 	privateKey ed25519.PrivateKey
 	publicKey  ed25519.PublicKey
+	torManager *tor.TorManager
+	useTor     bool
 }
 
-func newAegisServer(port int) (*AegisServer, error) {
-	log.Infof("Initializing Aegis server on port %d", port)
+func newAegisServer(port int, useTor bool) (*AegisServer, error) {
+	log.Infof("Initializing Aegis server on port %d (Tor: %v)", port, useTor)
 	storage := store.NewLocal()
 	srv := &AegisServer{
 		storage: storage,
+		useTor:  useTor,
 	}
 
 	if err := srv.initializeKeys(port); err != nil {
 		return nil, fmt.Errorf("failed to initialize keys: %w", err)
+	}
+
+	if useTor {
+		if err := srv.initializeTor(); err != nil {
+			return nil, fmt.Errorf("failed to initialize Tor: %w", err)
+		}
 	}
 
 	if err := srv.initializeNetwork(port); err != nil {
@@ -90,6 +100,17 @@ func (srv *AegisServer) initializeKeys(port int) error {
 	return nil
 }
 
+func (srv *AegisServer) initializeTor() error {
+	log.Info("Initializing Tor")
+	torManager, err := tor.StartTor()
+	if err != nil {
+		return fmt.Errorf("failed to start Tor: %w", err)
+	}
+	srv.torManager = torManager
+	log.Infof("Tor initialized successfully. Onion address: %s", torManager.OnionAddress)
+	return nil
+}
+
 func (srv *AegisServer) initializeNetwork(port int) error {
 	log.Infof("Initializing network on port %d", port)
 	addr := &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: port}
@@ -99,6 +120,8 @@ func (srv *AegisServer) initializeNetwork(port int) error {
 		Port:       port,
 		PublicKey:  srv.publicKey,
 		PrivateKey: srv.privateKey,
+		UseTor:     srv.useTor,
+		TorManager: srv.torManager,
 	}
 
 	srv.transport = network.NewTransport(networkConfig)
@@ -113,16 +136,32 @@ func (srv *AegisServer) initializeNetwork(port int) error {
 	return nil
 }
 
+func (srv *AegisServer) Shutdown() error {
+	if srv.torManager != nil {
+		if err := srv.torManager.StopTor(); err != nil {
+			log.Errorf("Error stopping Tor: %v", err)
+		}
+	}
+	if srv.transport != nil {
+		if err := srv.transport.Stop(); err != nil {
+			log.Errorf("Error stopping transport: %v", err)
+		}
+	}
+	return nil
+}
+
 func main() {
 	initLogger()
 	port := flag.Int("port", 8080, "Port to listen on")
+	useTor := flag.Bool("tor", false, "Use Tor network")
 	flag.Parse()
 
-	log.Infof("Starting Aegis server on port %d", *port)
-	_, err := newAegisServer(*port)
+	log.Infof("Starting Aegis server on port %d (Tor: %v)", *port, *useTor)
+	srv, err := newAegisServer(*port, *useTor)
 	if err != nil {
 		log.Fatalf("Failed to start server: %v", err)
 	}
+	defer srv.Shutdown()
 
 	log.Info("Aegis server is running")
 	// Keep running

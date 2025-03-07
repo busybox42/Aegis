@@ -1,68 +1,91 @@
 package network
 
 import (
-    "context"
-    "crypto/ed25519"
-    "net"
-    "testing"
-    "time"
+	"crypto/ed25519"
+	"net"
+	"testing"
 
-    "github.com/stretchr/testify/assert"
-    "github.com/stretchr/testify/require"
+	"github.com/busybox42/Aegis/pkg/tor"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestNewPeer(t *testing.T) {
-    pub, _, err := ed25519.GenerateKey(nil)
-    require.NoError(t, err)
+	pub, _, err := ed25519.GenerateKey(nil)
+	require.NoError(t, err)
 
-    addr := &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 8080}
-    peer := NewPeer(pub, addr)
+	addr := &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 8080}
+	peer := NewPeer(pub, addr)
 
-    require.NotNil(t, peer)
-    assert.Equal(t, pub, peer.PublicKey)
-    assert.Equal(t, addr.String(), peer.Address.String())
+	require.NotNil(t, peer)
+	assert.Equal(t, pub, peer.PublicKey)
+	assert.Equal(t, addr.String(), peer.Address.String())
 }
 
 func TestPeerConnection(t *testing.T) {
-    listener, err := net.ListenTCP("tcp", &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
-    require.NoError(t, err)
-    defer listener.Close()
+	tests := []struct {
+		name    string
+		useTor  bool
+		wantErr bool
+	}{
+		{
+			name:    "Regular TCP connection",
+			useTor:  false,
+			wantErr: false,
+		},
+		{
+			name:    "Tor connection",
+			useTor:  true,
+			wantErr: false,
+		},
+	}
 
-    pub, _, err := ed25519.GenerateKey(nil)
-    require.NoError(t, err)
-    
-    peer := NewPeer(pub, listener.Addr().(*net.TCPAddr))
-    
-    // Buffered channel to prevent blocking
-    connChan := make(chan struct{}, 1)
-    
-    // Start accepting connections in background
-    go func() {
-        conn, err := listener.Accept()
-        if err != nil {
-            t.Logf("Accept error: %v", err)
-            return
-        }
-        defer conn.Close()
-        connChan <- struct{}{}
-    }()
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if tt.useTor && testing.Short() {
+				t.Skip("Skipping Tor test in short mode")
+			}
 
-    ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-    defer cancel()
+			pub, priv, err := ed25519.GenerateKey(nil)
+			require.NoError(t, err)
 
-    // Create a dialer with context
-    dialer := &net.Dialer{}
-    conn, err := dialer.DialContext(ctx, "tcp", listener.Addr().String())
-    require.NoError(t, err)
-    defer conn.Close()
+			var torManager *tor.TorManager
+			if tt.useTor {
+				torManager, err = tor.StartTor()
+				require.NoError(t, err)
+				defer torManager.StopTor()
+			}
 
-    // Verify connection
-    assert.True(t, peer.Address != nil)
+			config := &Config{
+				Port:       0,
+				PublicKey:  pub,
+				PrivateKey: priv,
+				UseTor:     tt.useTor,
+				TorManager: torManager,
+			}
 
-    // Wait for accepted connection
-    select {
-    case <-connChan:
-    case <-ctx.Done():
-        t.Fatal("Timeout waiting for connection")
-    }
+			transport := NewTransport(config)
+			err = transport.Start()
+			require.NoError(t, err)
+			defer transport.Stop()
+
+			// Create a peer
+			addr := transport.listener.Addr().(*net.TCPAddr)
+			peer := NewPeer(pub, addr)
+
+			// Test connection
+			err = peer.Connect()
+			if tt.wantErr {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			require.True(t, peer.IsConnected())
+
+			// Test disconnection
+			err = peer.Disconnect()
+			require.NoError(t, err)
+			require.False(t, peer.IsConnected())
+		})
+	}
 }

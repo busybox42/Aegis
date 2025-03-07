@@ -1,171 +1,174 @@
 package network
 
 import (
-   "crypto/ed25519"
-   "encoding/binary"
-   "fmt"
-   "io"
-   "net"
-   "sync"
-   "time"
+	"crypto/ed25519"
+	"encoding/binary"
+	"fmt"
+	"io"
+	"net"
+	"sync"
+	"time"
 
-   "github.com/busybox42/Aegis/pkg/protocol"
+	"github.com/busybox42/Aegis/pkg/protocol"
 )
 
 type MessageHandler func(*protocol.Message) error
 
 type Peer struct {
-    PublicKey   ed25519.PublicKey
-    Address     *net.TCPAddr
-    conn        net.Conn
-    mu          sync.RWMutex
-    handler     MessageHandler
-    connected   bool
-    lastActive  time.Time
-    connecting  bool  // New field to prevent duplicate connection attempts
- }
+	PublicKey  ed25519.PublicKey
+	Address    *net.TCPAddr
+	conn       net.Conn
+	mu         sync.RWMutex
+	handler    MessageHandler
+	connected  bool
+	lastActive time.Time
+	connecting bool // New field to prevent duplicate connection attempts
+}
 
 func NewPeer(publicKey ed25519.PublicKey, addr *net.TCPAddr) *Peer {
-   return &Peer{
-       PublicKey: publicKey,
-       Address:   addr,
-       lastActive: time.Now(),
-   }
+	return &Peer{
+		PublicKey:  publicKey,
+		Address:    addr,
+		lastActive: time.Now(),
+	}
 }
 
 func (p *Peer) Connect() error {
-    p.mu.Lock()
-    if p.connected || p.connecting {
-        p.mu.Unlock()
-        return nil
-    }
-    p.connecting = true
-    p.mu.Unlock()
+	p.mu.Lock()
+	if p.connected || p.connecting {
+		p.mu.Unlock()
+		return nil
+	}
+	p.connecting = true
+	p.mu.Unlock()
 
-    defer func() {
-        p.mu.Lock()
-        p.connecting = false
-        p.mu.Unlock()
-    }()
+	defer func() {
+		p.mu.Lock()
+		p.connecting = false
+		p.mu.Unlock()
+	}()
 
-    // Use a shorter timeout for initial connection
-    dialer := net.Dialer{Timeout: 3 * time.Second}
-    conn, err := dialer.Dial("tcp", p.Address.String())
-    if err != nil {
-        return fmt.Errorf("connection failed: %w", err)
-    }
+	var conn net.Conn
+	var err error
 
-    p.mu.Lock()
-    if p.connected {
-        conn.Close()
-        p.mu.Unlock()
-        return nil
-    }
+	// Use regular TCP dialer
+	dialer := net.Dialer{Timeout: 3 * time.Second}
+	conn, err = dialer.Dial("tcp", p.Address.String())
 
-    p.conn = conn
-    p.connected = true
-    p.lastActive = time.Now()
-    p.mu.Unlock()
+	if err != nil {
+		return fmt.Errorf("connection failed: %w", err)
+	}
 
-    // Start connection handler
-    go p.handleConnection(conn)
-    return nil
+	p.mu.Lock()
+	if p.connected {
+		conn.Close()
+		p.mu.Unlock()
+		return nil
+	}
+
+	p.conn = conn
+	p.connected = true
+	p.lastActive = time.Now()
+	p.mu.Unlock()
+
+	go p.handleConnection(conn)
+	return nil
 }
 
 func (p *Peer) Disconnect() error {
-    p.mu.Lock()
-    defer p.mu.Unlock()
+	p.mu.Lock()
+	defer p.mu.Unlock()
 
-    if p.conn != nil {
-        err := p.conn.Close()
-        p.conn = nil
-        p.connected = false
-        return err
-    }
-    return nil
+	if p.conn != nil {
+		err := p.conn.Close()
+		p.conn = nil
+		p.connected = false
+		return err
+	}
+	return nil
 }
 
 func (p *Peer) handleConnection(conn net.Conn) {
-    defer func() {
-        p.mu.Lock()
-        p.connected = false
-        if p.conn == conn {
-            p.conn = nil
-        }
-        p.mu.Unlock()
-        conn.Close()
-    }()
+	defer func() {
+		p.mu.Lock()
+		p.connected = false
+		if p.conn == conn {
+			p.conn = nil
+		}
+		p.mu.Unlock()
+		conn.Close()
+	}()
 
-    for {
-        conn.SetReadDeadline(time.Now().Add(30 * time.Second))
-        
-        var msgLen uint32
-        if err := binary.Read(conn, binary.BigEndian, &msgLen); err != nil {
-            return
-        }
+	for {
+		conn.SetReadDeadline(time.Now().Add(30 * time.Second))
 
-        if msgLen > maxMsgSize {
-            return
-        }
+		var msgLen uint32
+		if err := binary.Read(conn, binary.BigEndian, &msgLen); err != nil {
+			return
+		}
 
-        msgData := make([]byte, msgLen)
-        if _, err := io.ReadFull(conn, msgData); err != nil {
-            return
-        }
+		if msgLen > maxMsgSize {
+			return
+		}
 
-        conn.SetReadDeadline(time.Time{})
-        p.updateLastActive()
-    }
+		msgData := make([]byte, msgLen)
+		if _, err := io.ReadFull(conn, msgData); err != nil {
+			return
+		}
+
+		conn.SetReadDeadline(time.Time{})
+		p.updateLastActive()
+	}
 }
 
 func (p *Peer) IsConnected() bool {
-   p.mu.RLock()
-   defer p.mu.RUnlock()
-   return p.connected && p.conn != nil
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.connected && p.conn != nil
 }
 
 func (p *Peer) SetMessageHandler(handler MessageHandler) {
-   p.mu.Lock()
-   defer p.mu.Unlock()
-   p.handler = handler
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.handler = handler
 }
 
 func (p *Peer) SendMessage(msg *protocol.Message) error {
-    p.mu.Lock()
-    defer p.mu.Unlock()
+	p.mu.Lock()
+	defer p.mu.Unlock()
 
-    if !p.connected || p.conn == nil {
-        return fmt.Errorf("peer not connected")
-    }
-    
-    data, err := msg.Serialize()
-    if err != nil {
-        return fmt.Errorf("serialization error: %w", err)
-    }
+	if !p.connected || p.conn == nil {
+		return fmt.Errorf("peer not connected")
+	}
 
-    if err := binary.Write(p.conn, binary.BigEndian, uint32(len(data))); err != nil {
-        p.connected = false
-        return fmt.Errorf("failed to write message length: %w", err)
-    }
+	data, err := msg.Serialize()
+	if err != nil {
+		return fmt.Errorf("serialization error: %w", err)
+	}
 
-    if _, err := p.conn.Write(data); err != nil {
-        p.connected = false
-        return fmt.Errorf("failed to write message: %w", err)
-    }
+	if err := binary.Write(p.conn, binary.BigEndian, uint32(len(data))); err != nil {
+		p.connected = false
+		return fmt.Errorf("failed to write message length: %w", err)
+	}
 
-    p.lastActive = time.Now()
-    return nil
+	if _, err := p.conn.Write(data); err != nil {
+		p.connected = false
+		return fmt.Errorf("failed to write message: %w", err)
+	}
+
+	p.lastActive = time.Now()
+	return nil
 }
 
 func (p *Peer) updateLastActive() {
-    p.mu.Lock()
-    defer p.mu.Unlock()
-    p.lastActive = time.Now()
- }
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.lastActive = time.Now()
+}
 
 func (t *Transport) handleMessage(msg *protocol.Message) error {
-    if handler, ok := t.getHandler(msg.Type); ok {
-        return handler(msg)
-    }
-    return nil
+	if handler, ok := t.getHandler(msg.Type); ok {
+		return handler(msg)
+	}
+	return nil
 }

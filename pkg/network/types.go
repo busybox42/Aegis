@@ -5,6 +5,7 @@ import (
 	"net"
 
 	"github.com/busybox42/Aegis/pkg/protocol"
+	"github.com/busybox42/Aegis/pkg/tor"
 )
 
 type MessageHandlerFunc func(*protocol.Message) error
@@ -15,8 +16,11 @@ type MessageRouter interface {
 }
 
 type Config struct {
-	Port       int
-	PrivateKey ed25519.PrivateKey
-	PublicKey  ed25519.PublicKey
-	Bootstrap  []*net.TCPAddr
+	Port         int
+	PrivateKey   ed25519.PrivateKey
+	PublicKey    ed25519.PublicKey
+	Bootstrap    []*net.TCPAddr
+	UseTor       bool
+	TorManager   *tor.TorManager
+	OnionAddress string
 }

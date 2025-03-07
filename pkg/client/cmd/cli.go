@@ -19,6 +19,7 @@ import (
 	"github.com/busybox42/Aegis/pkg/dht"
 	"github.com/busybox42/Aegis/pkg/network"
 	"github.com/busybox42/Aegis/pkg/protocol"
+	"github.com/busybox42/Aegis/pkg/tor"
 	"github.com/busybox42/Aegis/pkg/types"
 )
 
@@ -39,6 +40,8 @@ type AegisCLI struct {
 	publicKey      ed25519.PublicKey
 	messageHistory []MessageRecord
 	historyMu      sync.RWMutex
+	torManager     *tor.TorManager
+	useTor         bool
 }
 
 func newAegisCLI() *AegisCLI {
@@ -94,12 +97,21 @@ func (cli *AegisCLI) initializeKeys(port int) error {
 	return nil
 }
 
-func (cli *AegisCLI) initializeNetwork(port int, bootstrapPort int) error {
+func (cli *AegisCLI) initializeTor() error {
+	torManager, err := tor.StartTor()
+	if err != nil {
+		return fmt.Errorf("failed to start Tor: %w", err)
+	}
+	cli.torManager = torManager
+	return nil
+}
+
+func (cli *AegisCLI) initializeNetwork(port int, bootstrapIP string, bootstrapPort int) error {
 	addr := &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: port}
 	cli.localNode = types.NewNode(cli.publicKey, addr)
 
 	bootstrapAddr := &net.TCPAddr{
-		IP:   net.ParseIP("127.0.0.1"),
+		IP:   net.ParseIP(bootstrapIP),
 		Port: bootstrapPort,
 	}
 
@@ -108,6 +120,8 @@ func (cli *AegisCLI) initializeNetwork(port int, bootstrapPort int) error {
 		PublicKey:  cli.publicKey,
 		PrivateKey: cli.privateKey,
 		Bootstrap:  []*net.TCPAddr{bootstrapAddr},
+		UseTor:     cli.useTor,
+		TorManager: cli.torManager,
 	}
 
 	cli.transport = network.NewTransport(networkConfig)
@@ -115,16 +129,16 @@ func (cli *AegisCLI) initializeNetwork(port int, bootstrapPort int) error {
 	// Register message handler
 	cli.transport.RegisterHandler(protocol.TextMessage, func(msg *protocol.Message) error {
 		timestamp := time.Now().Format("2006-01-02 15:04:05")
-		
+
 		// Clear the current line
 		fmt.Print("\r")
-		
+
 		// Print the message with timestamp
 		fmt.Printf("\n[%s] Received message from %x: %s\n", timestamp, msg.Sender[:8], string(msg.Content))
-		
+
 		// Reprint the prompt
 		fmt.Print("aegis> ")
-		
+
 		// Record received message in history
 		cli.addToHistory(MessageRecord{
 			Timestamp: time.Now(),
@@ -134,9 +148,11 @@ func (cli *AegisCLI) initializeNetwork(port int, bootstrapPort int) error {
 			Status:    "received",
 		})
 		return nil
-	})	
+	})
 
-	cli.dht = dht.NewDHT(cli.localNode, cli.transport)
+	if !cli.useTor {
+		cli.dht = dht.NewDHT(cli.localNode, cli.transport)
+	}
 
 	return cli.transport.Start()
 }
@@ -221,9 +237,39 @@ func (cli *AegisCLI) findNodes(targetKey string) ([]*types.Node, error) {
 	return cli.transport.FindNode(ctx, nil, targetBytes)
 }
 
-func (cli *AegisCLI) startInteractiveCLI(port int, bootstrapPort int, isServer bool) error {
+// Add new method for sending Tor messages
+func (cli *AegisCLI) sendTorMessage(onionAddress string, message string) error {
+	// Validate onion address format
+	if !strings.HasSuffix(onionAddress, ".onion") {
+		return fmt.Errorf("invalid onion address: must end with .onion")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// Use the transport's SendTorMessage method
+	err := cli.transport.SendTorMessage(ctx, onionAddress, []byte(message))
+
+	// Record in history
+	status := "sent"
+	if err != nil {
+		status = "failed"
+	}
+
+	cli.addToHistory(MessageRecord{
+		Timestamp: time.Now(),
+		Sender:    cli.torManager.OnionAddress,
+		Recipient: onionAddress,
+		Content:   message,
+		Status:    status,
+	})
+
+	return err
+}
+
+func (cli *AegisCLI) startInteractiveCLI(port int, bootstrapIP string, bootstrapPort int, isServer bool) error {
 	// Initialize network
-	if err := cli.initializeNetwork(port, bootstrapPort); err != nil {
+	if err := cli.initializeNetwork(port, bootstrapIP, bootstrapPort); err != nil {
 		return fmt.Errorf("failed to initialize network: %v", err)
 	}
 
@@ -231,12 +277,14 @@ func (cli *AegisCLI) startInteractiveCLI(port int, bootstrapPort int, isServer b
 	if isServer {
 		nodeType = "server"
 	}
-	
+
 	// Print local node info
 	fmt.Printf("Local Node (%s) Public Key: %x\n", nodeType, cli.publicKey)
 	fmt.Printf("Listening on port: %d\n", port)
-	if !isServer {
-		fmt.Printf("Bootstrapping to: 127.0.0.1:%d\n", bootstrapPort)
+	if cli.useTor {
+		fmt.Printf("Tor enabled - Onion address: %s\n", cli.torManager.OnionAddress)
+	} else {
+		fmt.Printf("DHT mode - Bootstrapping to: %s:%d\n", bootstrapIP, bootstrapPort)
 	}
 
 	// Start interactive prompt
@@ -274,27 +322,43 @@ func (cli *AegisCLI) startInteractiveCLI(port int, bootstrapPort int, isServer b
 
 		case "send":
 			if args == "" {
-				fmt.Println("Usage: send <recipient_key> <message>")
+				if cli.useTor {
+					fmt.Println("Usage: send <onion_address> <message>")
+				} else {
+					fmt.Println("Usage: send <recipient_key> <message>")
+				}
 				continue
 			}
 			sendParts := strings.SplitN(args, " ", 2)
 			if len(sendParts) < 2 {
-				fmt.Println("Usage: send <recipient_key> <message>")
+				if cli.useTor {
+					fmt.Println("Usage: send <onion_address> <message>")
+				} else {
+					fmt.Println("Usage: send <recipient_key> <message>")
+				}
 				continue
 			}
-			recipientKey := sendParts[0]
+			recipient := sendParts[0]
 			message := sendParts[1]
 
-			recipientBytes, err := hex.DecodeString(recipientKey)
-			if err != nil {
-				fmt.Printf("Invalid recipient key: %v\n", err)
-				continue
-			}
-
-			if err := cli.sendMessage(recipientBytes, message); err != nil {
-				fmt.Printf("Failed to send message: %v\n", err)
+			if cli.useTor {
+				if err := cli.sendTorMessage(recipient, message); err != nil {
+					fmt.Printf("Failed to send message: %v\n", err)
+				} else {
+					fmt.Println("Message sent successfully")
+				}
 			} else {
-				fmt.Println("Message sent successfully")
+				recipientBytes, err := hex.DecodeString(recipient)
+				if err != nil {
+					fmt.Printf("Invalid recipient key: %v\n", err)
+					continue
+				}
+
+				if err := cli.sendMessage(recipientBytes, message); err != nil {
+					fmt.Printf("Failed to send message: %v\n", err)
+				} else {
+					fmt.Println("Message sent successfully")
+				}
 			}
 
 		case "find":
@@ -364,9 +428,13 @@ func (cli *AegisCLI) startInteractiveCLI(port int, bootstrapPort int, isServer b
 
 		case "help":
 			fmt.Println("Available commands:")
-			fmt.Println("  bootstrap <ip:port>             - Add a bootstrap node to discover peers")
-			fmt.Println("  send <recipient_key> <message>  - Send a message to a recipient")
-			fmt.Println("  find <target_key>              - Find nodes with a specific key")
+			if cli.useTor {
+				fmt.Println("  send <onion_address> <message>   - Send a message to a Tor hidden service")
+			} else {
+				fmt.Println("  send <recipient_key> <message>   - Send a message to a recipient")
+				fmt.Println("  find <target_key>                - Find nodes with a specific key")
+				fmt.Println("  bootstrap <ip:port>              - Add a bootstrap node to discover peers")
+			}
 			fmt.Println("  list                           - List all connected peers")
 			fmt.Println("  status                         - Show network status")
 			fmt.Println("  history                        - Show message history")
@@ -387,6 +455,7 @@ func main() {
 	port := flag.Int("port", 0, "Port to listen on (random high port if not specified)")
 	bootstrapIP := flag.String("bootstrap-ip", "127.0.0.1", "Bootstrap node IP address")
 	bootstrapPort := flag.Int("bootstrap-port", 8080, "Bootstrap node port")
+	useTor := flag.Bool("tor", false, "Use Tor network instead of DHT")
 	flag.Parse()
 
 	// Determine port
@@ -405,8 +474,19 @@ func main() {
 		log.Fatalf("Failed to initialize keys: %v", err)
 	}
 
-	log.Printf("Starting Aegis client on port %d, bootstrapping to %s:%d", *port, *bootstrapIP, *bootstrapPort)
-	if err := cli.startInteractiveCLI(*port, *bootstrapPort, false); err != nil {
+	// Initialize Tor if requested
+	cli.useTor = *useTor
+	if cli.useTor {
+		if err := cli.initializeTor(); err != nil {
+			log.Fatalf("Failed to initialize Tor: %v", err)
+		}
+		defer cli.torManager.StopTor()
+	}
+
+	log.Printf("Starting Aegis client on port %d (Mode: %s)", *port,
+		map[bool]string{true: "Tor", false: "DHT"}[cli.useTor])
+
+	if err := cli.startInteractiveCLI(*port, *bootstrapIP, *bootstrapPort, false); err != nil {
 		log.Fatalf("CLI error: %v", err)
 	}
 }
